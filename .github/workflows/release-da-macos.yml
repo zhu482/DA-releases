@@ -3,6 +3,11 @@ name: release-da-macos-github
 on:
   workflow_dispatch:
     inputs:
+      validation_only:
+        description: "Validate the public runner, private source checkout, and release toolchain without publishing."
+        required: true
+        type: boolean
+        default: false
       publish:
         description: "Publish the signed DA release and move the in-app updater feed."
         required: true
@@ -121,23 +126,36 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN" || { echo "missing GitHub workflow token" >&2; exit 1; }
-          test -n "$APPLE_SIGNING_CERTIFICATE_BASE64" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_BASE64" >&2; exit 1; }
-          test -n "$APPLE_SIGNING_CERTIFICATE_PASSWORD" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_PASSWORD" >&2; exit 1; }
           visibility="$(gh api "repos/$GH_REPO" --jq .visibility)"
           test "$visibility" = "public" || { echo "$GH_REPO must remain public for token-free in-app updates" >&2; exit 1; }
+          if [ "${{ inputs.validation_only }}" = "true" ]; then
+            exit 0
+          fi
+          test -n "$APPLE_SIGNING_CERTIFICATE_BASE64" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_BASE64" >&2; exit 1; }
+          test -n "$APPLE_SIGNING_CERTIFICATE_PASSWORD" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_PASSWORD" >&2; exit 1; }
           if [ "${{ inputs.sign_mode }}" = "notarize" ]; then
             test -n "$APPLE_ID" || { echo "missing GitHub secret APPLE_ID" >&2; exit 1; }
             test -n "$APPLE_TEAM_ID" || { echo "missing GitHub secret APPLE_TEAM_ID" >&2; exit 1; }
             test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "missing GitHub secret APPLE_APP_SPECIFIC_PASSWORD" >&2; exit 1; }
           fi
 
+      - name: Validate DA release source on this runner
+        if: ${{ inputs.validation_only }}
+        run: |
+          set -euo pipefail
+          pnpm --filter @open-design/tools-release typecheck
+          pnpm --filter @open-design/tools-pack typecheck
+          pnpm --filter @open-design/desktop typecheck
+
       - name: Resolve next DA release version
+        if: ${{ !inputs.validation_only }}
         id: prepare
         env:
           DA_BETAS_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
         run: pnpm exec tools-release prepare betas
 
       - name: Select and validate DA release version
+        if: ${{ !inputs.validation_only }}
         id: version
         env:
           MANUAL_VERSION: ${{ inputs.release_version }}
@@ -160,6 +178,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Capture previous updater feed
+        if: ${{ !inputs.validation_only }}
         env:
           PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
           RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
@@ -172,6 +191,7 @@ jobs:
             -o "$PREVIOUS_METADATA_PATH" || rm -f "$PREVIOUS_METADATA_PATH"
 
       - name: Build signed and notarized DA macOS artifacts
+        if: ${{ !inputs.validation_only }}
         env:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -199,7 +219,7 @@ jobs:
         run: bash tools/release/scripts/build-platform.sh
 
       - name: Prepare immutable updater assets
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           RELEASE_ARTIFACT_MODE: dmg-and-payload
           RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
@@ -214,7 +234,7 @@ jobs:
         run: bash tools/release/scripts/prepare-platform-assets.sh
 
       - name: Generate GitHub Release platform manifest
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           RELEASE_ARTIFACT_MODE: dmg-and-payload
           RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
@@ -236,7 +256,7 @@ jobs:
         run: pnpm exec tools-release publish-platform
 
       - name: Generate complete DA release metadata
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           BASE_VERSION: ${{ steps.prepare.outputs.base_version }}
           ENABLE_LINUX_X64: "false"
@@ -275,7 +295,7 @@ jobs:
           NODE
 
       - name: Publish immutable GitHub Release
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           GH_REPO: ${{ steps.distribution.outputs.repository }}
           GH_TOKEN: ${{ github.token }}
@@ -303,7 +323,7 @@ jobs:
           gh release edit "$VERSION_TAG" --repo "$GH_REPO" --draft=false --prerelease
 
       - name: Verify immutable version from GitHub
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           RELEASE_METADATA_URL: ${{ steps.version.outputs.version_origin }}/metadata.json
           RELEASE_PUBLIC_ORIGIN: ${{ steps.distribution.outputs.release_download_root }}
@@ -314,7 +334,7 @@ jobs:
         run: pnpm exec tools-release verify-public-release
 
       - name: Atomically move the public updater feed
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           FEED_CHECKOUT: ${{ github.workspace }}/feed
           GH_REPO: ${{ steps.distribution.outputs.repository }}
@@ -338,7 +358,7 @@ jobs:
           git -C "$FEED_CHECKOUT" push origin HEAD:main
 
       - name: Verify live in-app updater feed and every artifact
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
           RELEASE_PUBLIC_ORIGINS: ${{ steps.distribution.outputs.latest_origin }},${{ steps.distribution.outputs.release_download_root }}
@@ -349,7 +369,7 @@ jobs:
         run: pnpm exec tools-release verify-public-release
 
       - name: Resolve previous DA release for live updater acceptance
-        if: ${{ inputs.publish }}
+        if: ${{ !inputs.validation_only && inputs.publish }}
         id: previous_release
         env:
           CURRENT_RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
@@ -401,7 +421,7 @@ jobs:
           NODE
 
       - name: Prove previous installed DA updates from live GitHub and retains its project
-        if: ${{ inputs.publish && steps.previous_release.outputs.available == 'true' }}
+        if: ${{ !inputs.validation_only && inputs.publish && steps.previous_release.outputs.available == 'true' }}
         env:
           OD_PACKAGED_E2E_BUILD_JSON_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.json
           OD_PACKAGED_E2E_BUILD_LOG_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.log
@@ -450,6 +470,7 @@ jobs:
             echo "- version: \`$RELEASE_VERSION\`"
             echo "- updater feed: $UPDATE_URL"
             echo "- distribution: GitHub Releases + atomic public manifest commit"
+            echo "- validation only: \`${{ inputs.validation_only }}\`"
             echo "- publish requested: \`${{ inputs.publish }}\`"
             echo "- signing: \`${{ inputs.sign_mode }}\`"
             echo "- smoke: \`${{ inputs.smoke_mode }}\`"
