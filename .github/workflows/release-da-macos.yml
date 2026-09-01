@@ -269,6 +269,101 @@ jobs:
           TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/tools-pack
         run: bash tools/release/scripts/prepare-platform-assets.sh
 
+      - name: Resolve previous launcher payload for delta
+        if: ${{ !inputs.validation_only && inputs.publish }}
+        id: previous_payload
+        env:
+          EXPECTED_SIGNED: ${{ steps.version.outputs.release_signed }}
+          PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
+          RELEASE_DOWNLOAD_ROOT: ${{ steps.distribution.outputs.release_download_root }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync } from "node:fs";
+          const output = process.env.GITHUB_OUTPUT;
+          const path = process.env.PREVIOUS_METADATA_PATH;
+          if (!existsSync(path)) {
+            appendFileSync(output, "available=false\n");
+            process.exit(0);
+          }
+          const metadata = JSON.parse(readFileSync(path, "utf8"));
+          const target = metadata.releaseTargets?.mac_arm64;
+          const payload = target?.artifacts?.payload;
+          const version = metadata.releaseVersion;
+          const valid =
+            typeof version === "string" &&
+            target?.status === "published" &&
+            target?.signed === (process.env.EXPECTED_SIGNED === "true") &&
+            typeof payload?.url === "string" &&
+            typeof payload?.sha256Url === "string";
+          if (!valid) {
+            appendFileSync(output, "available=false\n");
+            process.exit(0);
+          }
+          const prefix = process.env.RELEASE_DOWNLOAD_ROOT.replace(/\/+$/u, "") + "/";
+          for (const url of [payload.url, payload.sha256Url]) {
+            if (!url.startsWith(prefix) || new URL(url).protocol !== "https:") {
+              throw new Error(`previous payload URL is outside GitHub Releases: ${url}`);
+            }
+          }
+          appendFileSync(output, [
+            "available=true",
+            `release_version=${version}`,
+            `payload_url=${payload.url}`,
+            `sha256_url=${payload.sha256Url}`,
+            "",
+          ].join("\n"));
+          NODE
+
+      - name: Build file-level launcher payload delta
+        if: ${{ !inputs.validation_only && inputs.publish && steps.previous_payload.outputs.available == 'true' }}
+        id: payload_delta
+        env:
+          ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
+          CURRENT_VERSION: ${{ steps.version.outputs.release_version }}
+          PREVIOUS_PAYLOAD_SHA256_URL: ${{ steps.previous_payload.outputs.sha256_url }}
+          PREVIOUS_PAYLOAD_URL: ${{ steps.previous_payload.outputs.payload_url }}
+          PREVIOUS_VERSION: ${{ steps.previous_payload.outputs.release_version }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/da-release/assets/mac_arm64
+          RELEASE_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
+        run: |
+          set -euo pipefail
+          delta_root="${{ runner.temp }}/da-release/payload-delta"
+          base_payload="$delta_root/base-payload.zip"
+          base_sha="$base_payload.sha256"
+          target_payload="$RELEASE_ASSETS_DIR/open-design-$CURRENT_VERSION$ASSET_SUFFIX-mac-arm64-payload.zip"
+          safe_base="${PREVIOUS_VERSION//[^A-Za-z0-9._-]/-}"
+          delta_name="open-design-$CURRENT_VERSION$ASSET_SUFFIX-mac-arm64-payload-delta-from-$safe_base.zip"
+          delta_path="$RELEASE_ASSETS_DIR/$delta_name"
+          result_path="$delta_root/result.json"
+          mkdir -p "$delta_root"
+          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
+            "$PREVIOUS_PAYLOAD_URL?delta=${{ github.run_id }}" -o "$base_payload"
+          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
+            "$PREVIOUS_PAYLOAD_SHA256_URL?delta=${{ github.run_id }}" -o "$base_sha"
+          expected_sha="$(awk '{print $1}' "$base_sha" | tr '[:upper:]' '[:lower:]')"
+          [[ "$expected_sha" =~ ^[a-f0-9]{64}$ ]] || { echo "invalid previous payload checksum" >&2; exit 1; }
+          test "$(shasum -a 256 "$base_payload" | awk '{print $1}')" = "$expected_sha" || {
+            echo "previous payload checksum mismatch" >&2
+            exit 1
+          }
+          pnpm exec tools-pack mac delta \
+            --namespace "$RELEASE_NAMESPACE" \
+            --base-payload-path "$base_payload" \
+            --target-payload-path "$target_payload" \
+            --output-path "$delta_path" \
+            > "$result_path"
+          (cd "$RELEASE_ASSETS_DIR" && shasum -a 256 "$delta_name" > "$delta_name.sha256")
+          target_tree="$(node -e 'const x=require(process.argv[1]); process.stdout.write(x.targetTreeSha256)' "$result_path")"
+          {
+            echo "available=true"
+            echo "base_payload_path=$base_payload"
+            echo "base_version=$PREVIOUS_VERSION"
+            echo "name=$delta_name"
+            echo "size=$(stat -f %z "$delta_path")"
+            echo "target_tree_sha256=$target_tree"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate GitHub Release platform manifest
         if: ${{ !inputs.validation_only && inputs.publish }}
         env:
@@ -282,6 +377,9 @@ jobs:
           RELEASE_LATEST_PUBLIC_URL_LAYOUT: hierarchical
           RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
           RELEASE_OUTPUTS_PATH: ${{ runner.temp }}/da-release/platform-outputs.json
+          RELEASE_PAYLOAD_DELTA_BASE_VERSION: ${{ steps.payload_delta.outputs.base_version }}
+          RELEASE_PAYLOAD_DELTA_NAME: ${{ steps.payload_delta.outputs.name }}
+          RELEASE_PAYLOAD_DELTA_TARGET_TREE_SHA256: ${{ steps.payload_delta.outputs.target_tree_sha256 }}
           RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
           RELEASE_PUBLIC_URL_LAYOUT: flat
           RELEASE_PUBLISH_SIDE_EFFECTS: "false"
@@ -411,98 +509,31 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
         run: pnpm exec tools-release verify-public-release
 
-      - name: Resolve previous DA release for live updater acceptance
-        if: ${{ !inputs.validation_only && inputs.publish }}
-        id: previous_release
+      - name: Prove previous DA payload applies the live delta and retains its project
+        if: ${{ !inputs.validation_only && inputs.publish && steps.payload_delta.outputs.available == 'true' }}
         env:
-          CURRENT_RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
-          EXPECTED_SIGNED: ${{ steps.version.outputs.release_signed }}
-          PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
-          RELEASE_DOWNLOAD_ROOT: ${{ steps.distribution.outputs.release_download_root }}
-        run: |
-          set -euo pipefail
-          node --input-type=module <<'NODE'
-          import { appendFileSync, existsSync, readFileSync } from "node:fs";
-          const output = process.env.GITHUB_OUTPUT;
-          const previousPath = process.env.PREVIOUS_METADATA_PATH;
-          if (!existsSync(previousPath)) {
-            appendFileSync(output, "available=false\n");
-            process.exit(0);
-          }
-          const metadata = JSON.parse(readFileSync(previousPath, "utf8"));
-          const version = metadata.releaseVersion;
-          const target = metadata.releaseTargets?.mac_arm64;
-          const dmg = target?.artifacts?.dmg;
-          const expectedSigned = process.env.EXPECTED_SIGNED === "true";
-          const valid =
-            typeof version === "string" &&
-            version !== process.env.CURRENT_RELEASE_VERSION &&
-            /^[0-9]+\.[0-9]+\.[0-9]+-betas\.[1-9][0-9]*$/u.test(version) &&
-            metadata.releaseState === "complete" &&
-            target?.status === "published" &&
-            target?.signed === expectedSigned &&
-            typeof dmg?.url === "string" &&
-            typeof dmg?.sha256Url === "string" &&
-            Number.isSafeInteger(dmg?.size) &&
-            dmg.size > 0;
-          if (!valid) {
-            appendFileSync(output, "available=false\n");
-            process.exit(0);
-          }
-          const releasePrefix = process.env.RELEASE_DOWNLOAD_ROOT.replace(/\/+$/u, "") + "/";
-          for (const url of [dmg.url, dmg.sha256Url]) {
-            if (!url.startsWith(releasePrefix) || new URL(url).protocol !== "https:") {
-              throw new Error(`previous release URL is outside GitHub Releases: ${url}`);
-            }
-          }
-          appendFileSync(output, [
-            "available=true",
-            `release_version=${version}`,
-            `dmg_url=${dmg.url}`,
-            `sha256_url=${dmg.sha256Url}`,
-            `size=${dmg.size}`,
-            "",
-          ].join("\n"));
-          NODE
-
-      - name: Prove previous installed DA updates from live GitHub and retains its project
-        if: ${{ !inputs.validation_only && inputs.publish && steps.previous_release.outputs.available == 'true' }}
-        env:
-          OD_PACKAGED_E2E_BUILD_JSON_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.json
-          OD_PACKAGED_E2E_BUILD_LOG_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.log
+          OD_PACKAGED_E2E_BUILD_JSON_PATH: ${{ runner.temp }}/da-release/build/build.json
+          OD_PACKAGED_E2E_BUILD_LOG_PATH: ${{ runner.temp }}/da-release/build/build.log
           OD_PACKAGED_E2E_MAC: "1"
           OD_PACKAGED_E2E_MAC_SMOKE_PROFILE: full
           OD_PACKAGED_E2E_MAC_UPDATE_DOWNLOAD_TIMEOUT_MS: "1200000"
           OD_PACKAGED_E2E_MAC_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+          OD_PACKAGED_E2E_MAC_SEED_PAYLOAD_PATH: ${{ steps.payload_delta.outputs.base_payload_path }}
           OD_PACKAGED_E2E_MAC_UPDATE_VERSION: ${{ steps.version.outputs.release_version }}
           OD_PACKAGED_E2E_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
           OD_PACKAGED_E2E_RELEASE_CHANNEL: betas
-          OD_PACKAGED_E2E_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
+          OD_PACKAGED_E2E_RELEASE_VERSION: ${{ steps.payload_delta.outputs.base_version }}
           OD_PACKAGED_E2E_REPORT_DIR: ${{ runner.temp }}/da-release/report/live-github-updater
-          OD_PACKAGED_E2E_TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/live-updater-acceptance/tools-pack
-          PREVIOUS_DMG_SHA256_URL: ${{ steps.previous_release.outputs.sha256_url }}
-          PREVIOUS_DMG_SIZE: ${{ steps.previous_release.outputs.size }}
-          PREVIOUS_DMG_URL: ${{ steps.previous_release.outputs.dmg_url }}
-          PREVIOUS_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
+          OD_PACKAGED_E2E_TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/tools-pack
         run: |
           set -euo pipefail
-          dmg_path="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/out/mac/namespaces/${OD_PACKAGED_E2E_NAMESPACE}/dmg/Design AI-${OD_PACKAGED_E2E_NAMESPACE}.dmg"
-          sha_path="$dmg_path.sha256"
-          mkdir -p "$(dirname "$dmg_path")" "$OD_PACKAGED_E2E_REPORT_DIR"
-          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
-            "$PREVIOUS_DMG_URL?acceptance=${{ github.run_id }}" -o "$dmg_path"
-          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
-            "$PREVIOUS_DMG_SHA256_URL?acceptance=${{ github.run_id }}" -o "$sha_path"
-          expected_sha="$(awk '{print $1}' "$sha_path")"
-          [[ "$expected_sha" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "invalid previous DMG checksum" >&2; exit 1; }
-          expected_sha="$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')"
-          actual_sha="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
-          test "$actual_sha" = "$expected_sha" || { echo "previous DMG checksum mismatch" >&2; exit 1; }
-          actual_size="$(stat -f %z "$dmg_path")"
-          test "$actual_size" = "$PREVIOUS_DMG_SIZE" || { echo "previous DMG size mismatch" >&2; exit 1; }
-          printf '{"dmgPath":"%s","version":"%s"}\n' "$dmg_path" "$PREVIOUS_RELEASE_VERSION" > "$OD_PACKAGED_E2E_BUILD_JSON_PATH"
-          : > "$OD_PACKAGED_E2E_BUILD_LOG_PATH"
           pnpm --dir e2e exec tsx scripts/release-smoke.ts mac specs/mac.spec.ts
+          updater_logs="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/runtime/mac/namespaces/$OD_PACKAGED_E2E_NAMESPACE/logs"
+          rg '"event":"payload-ready".*"delivery":"delta"|"delivery":"delta".*"event":"payload-ready"' "$updater_logs"
+          if rg '"event":"payload-delta-fallback"' "$updater_logs"; then
+            echo "client fell back to the full payload instead of applying the delta" >&2
+            exit 1
+          fi
 
       - name: Publish DA release summary
         if: ${{ always() }}
