@@ -3,29 +3,29 @@
   "artifacts": {
     "dmg": {
       "contentType": "application/x-apple-diskimage",
-      "name": "open-design-0.18.2-betas.1.unsigned-mac-arm64.dmg",
-      "size": 305917222,
-      "url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1/open-design-0.18.2-betas.1.unsigned-mac-arm64.dmg",
-      "sha256Url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1/open-design-0.18.2-betas.1.unsigned-mac-arm64.dmg.sha256"
+      "name": "open-design-0.18.2-betas.2.unsigned-mac-arm64.dmg",
+      "size": 305910087,
+      "url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2/open-design-0.18.2-betas.2.unsigned-mac-arm64.dmg",
+      "sha256Url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2/open-design-0.18.2-betas.2.unsigned-mac-arm64.dmg.sha256"
     },
     "payload": {
       "contentType": "application/zip",
-      "name": "open-design-0.18.2-betas.1.unsigned-mac-arm64-payload.zip",
-      "size": 325735069,
-      "url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1/open-design-0.18.2-betas.1.unsigned-mac-arm64-payload.zip",
-      "sha256Url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1/open-design-0.18.2-betas.1.unsigned-mac-arm64-payload.zip.sha256"
+      "name": "open-design-0.18.2-betas.2.unsigned-mac-arm64-payload.zip",
+      "size": 325735071,
+      "url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2/open-design-0.18.2-betas.2.unsigned-mac-arm64-payload.zip",
+      "sha256Url": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2/open-design-0.18.2-betas.2.unsigned-mac-arm64-payload.zip.sha256"
     }
   },
   "channel": "betas",
   "enabled": true,
   "feed": null,
-  "generatedAt": "2026-09-01T10:04:17.191Z",
+  "generatedAt": "2026-09-01T10:41:49.712Z",
   "github": {
     "branch": "gr-portover-20260812",
     "commit": "89a23756ba5e42339f3fadb9b0b49a75cd71ea0b",
     "repository": "zhu482/DA",
     "runAttempt": 1,
-    "runId": 33494255625,
+    "runId": 33497745641,
     "workflow": "release-da-macos-github"
   },
   "dryRun": false,
@@ -40,11 +40,11 @@
     "latestManifestUrl": "https://raw.githubusercontent.com/zhu482/DA-releases/main/betas/latest/platforms/mac_arm64.json",
     "latestPrefix": "betas/latest",
     "latestPublicOrigin": "https://raw.githubusercontent.com/zhu482/DA-releases/main",
-    "publicOrigin": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1",
-    "versionManifestUrl": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.1/platforms--mac_arm64.json",
-    "versionPrefix": "betas/versions/0.18.2-betas.1.unsigned"
+    "publicOrigin": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2",
+    "versionManifestUrl": "https://github.com/zhu482/DA-releases/releases/download/da-unsigned-test-0.18.2-betas.2/platforms--mac_arm64.json",
+    "versionPrefix": "betas/versions/0.18.2-betas.2.unsigned"
   },
-  "releaseVersion": "0.18.2-betas.1",
+  "releaseVersion": "0.18.2-betas.2",
   "signed": false,
   "status": "published",
   "version": 1
