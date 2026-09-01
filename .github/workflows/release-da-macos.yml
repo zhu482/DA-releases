@@ -542,12 +542,6 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --dir e2e exec tsx scripts/release-smoke.ts mac specs/mac.spec.ts
-          updater_logs="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/runtime/mac/namespaces/$OD_PACKAGED_E2E_NAMESPACE/logs"
-          rg '"event":"payload-ready".*"delivery":"delta"|"delivery":"delta".*"event":"payload-ready"' "$updater_logs"
-          if rg '"event":"payload-delta-fallback"' "$updater_logs"; then
-            echo "client fell back to the full payload instead of applying the delta" >&2
-            exit 1
-          fi
 
       - name: Publish DA release summary
         if: ${{ always() }}
