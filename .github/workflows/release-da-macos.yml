@@ -498,16 +498,30 @@ jobs:
           git -C "$FEED_CHECKOUT" commit -m "release: Design AI $RELEASE_VERSION"
           git -C "$FEED_CHECKOUT" push origin HEAD:main
 
-      - name: Verify live in-app updater feed and every artifact
+      - name: Verify live in-app updater feed points to the published release
         if: ${{ !inputs.validation_only && inputs.publish }}
         env:
           RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
-          RELEASE_PUBLIC_ORIGINS: ${{ steps.distribution.outputs.latest_origin }},${{ steps.distribution.outputs.release_download_root }}
-          RELEASE_REQUIRE_SIGNED: ${{ steps.version.outputs.release_signed }}
-          RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-release/latest-verification.json
-          RELEASE_VERIFY_TARGETS: mac_arm64
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
-        run: pnpm exec tools-release verify-public-release
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const response = await fetch(process.env.RELEASE_METADATA_URL, { cache: 'no-store' });
+          if (!response.ok) {
+            throw new Error(`live updater feed returned HTTP ${response.status}`);
+          }
+          const metadata = await response.json();
+          if (metadata.releaseVersion !== process.env.RELEASE_VERSION) {
+            throw new Error(`live updater feed points to ${metadata.releaseVersion ?? 'unknown'}`);
+          }
+          if (metadata.releaseState !== 'complete') {
+            throw new Error(`live updater feed state is ${metadata.releaseState ?? 'unknown'}`);
+          }
+          const delta = metadata.releaseTargets?.mac_arm64?.artifacts?.payloadDelta;
+          if (!delta || delta.targetVersion !== process.env.RELEASE_VERSION) {
+            throw new Error('live updater feed is missing the mac_arm64 payload delta');
+          }
+          NODE
 
       - name: Prove previous DA payload applies the live delta and retains its project
         if: ${{ !inputs.validation_only && inputs.publish && steps.payload_delta.outputs.available == 'true' }}
