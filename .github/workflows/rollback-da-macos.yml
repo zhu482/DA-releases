@@ -1,0 +1,140 @@
+name: rollback-da-macos-github
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Previously verified version to restore, for example 0.18.2-betas.11."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: da-macos-github-betas
+  cancel-in-progress: false
+
+env:
+  PATH: /opt/homebrew/opt/node@24/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+jobs:
+  rollback:
+    name: Restore a verified DA updater feed
+    runs-on: [self-hosted, macOS, ARM64, da-release-public]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout public release feed
+        uses: actions/checkout@v6.0.2
+        with:
+          clean: true
+          fetch-depth: 1
+          lfs: false
+          path: feed
+
+      - name: Checkout private DA verifier read-only
+        uses: actions/checkout@v6.0.2
+        with:
+          clean: true
+          fetch-depth: 1
+          lfs: false
+          path: source
+          ref: gr-portover-20260812
+          repository: zhu482/DA
+          ssh-key: ${{ secrets.DA_SOURCE_DEPLOY_KEY }}
+
+      - name: Install DA release verifier
+        run: |
+          set -euo pipefail
+          corepack prepare pnpm@10.33.2 --activate
+          pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Validate rollback authority and resolve endpoints
+        id: rollback
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo "missing GitHub workflow token" >&2; exit 1; }
+          [[ "$GH_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid release_repository" >&2; exit 1; }
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-betas\.[1-9][0-9]*$ ]] || { echo "invalid release_version" >&2; exit 1; }
+          visibility="$(gh api "repos/$GH_REPO" --jq .visibility)"
+          test "$visibility" = "public" || { echo "$GH_REPO must be public" >&2; exit 1; }
+          tag="da-$RELEASE_VERSION"
+          gh release view "$tag" --repo "$GH_REPO" >/dev/null
+          {
+            echo "repository=$GH_REPO"
+            echo "tag=$tag"
+            echo "version_origin=https://github.com/$GH_REPO/releases/download/$tag"
+            echo "release_download_root=https://github.com/$GH_REPO/releases/download"
+            echo "latest_origin=https://raw.githubusercontent.com/$GH_REPO/main"
+            echo "latest_url=https://raw.githubusercontent.com/$GH_REPO/main/betas/latest/metadata.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download immutable rollback metadata
+        env:
+          ROLLBACK_DIR: ${{ runner.temp }}/da-rollback
+          VERSION_ORIGIN: ${{ steps.rollback.outputs.version_origin }}
+        run: |
+          set -euo pipefail
+          rm -rf "$ROLLBACK_DIR"
+          mkdir -p "$ROLLBACK_DIR/platforms"
+          /usr/bin/curl --fail --location --silent --show-error \
+            "$VERSION_ORIGIN/metadata.json" -o "$ROLLBACK_DIR/metadata.json"
+          /usr/bin/curl --fail --location --silent --show-error \
+            "$VERSION_ORIGIN/platforms--mac_arm64.json" -o "$ROLLBACK_DIR/platforms/mac_arm64.json"
+
+      - name: Verify every rollback artifact before moving latest
+        env:
+          RELEASE_METADATA_URL: ${{ steps.rollback.outputs.version_origin }}/metadata.json
+          RELEASE_PUBLIC_ORIGIN: ${{ steps.rollback.outputs.release_download_root }}
+          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-rollback/version-verification.json
+          RELEASE_VERIFY_TARGETS: mac_arm64
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: pnpm exec tools-release verify-public-release
+
+      - name: Atomically restore the public updater feed
+        env:
+          FEED_CHECKOUT: ${{ github.workspace }}/feed
+          GH_REPO: ${{ steps.rollback.outputs.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          ROLLBACK_DIR: ${{ runner.temp }}/da-rollback
+        run: |
+          set -euo pipefail
+          mkdir -p "$FEED_CHECKOUT/betas/latest/platforms"
+          cp "$ROLLBACK_DIR/platforms/mac_arm64.json" "$FEED_CHECKOUT/betas/latest/platforms/mac_arm64.json"
+          cp "$ROLLBACK_DIR/metadata.json" "$FEED_CHECKOUT/betas/latest/metadata.json"
+          git -C "$FEED_CHECKOUT" config user.name "Design AI Release Bot"
+          git -C "$FEED_CHECKOUT" config user.email "design-ai-release@users.noreply.github.com"
+          git -C "$FEED_CHECKOUT" add betas/latest
+          git -C "$FEED_CHECKOUT" commit -m "rollback: Design AI $RELEASE_VERSION"
+          git -C "$FEED_CHECKOUT" push origin HEAD:main
+
+      - name: Verify restored live updater feed
+        env:
+          RELEASE_METADATA_URL: ${{ steps.rollback.outputs.latest_url }}
+          RELEASE_PUBLIC_ORIGINS: ${{ steps.rollback.outputs.latest_origin }},${{ steps.rollback.outputs.release_download_root }}
+          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-rollback/latest-verification.json
+          RELEASE_VERIFY_TARGETS: mac_arm64
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: pnpm exec tools-release verify-public-release
+
+      - name: Publish rollback summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Design AI updater rollback"
+            echo
+            echo "- restored feed version: \`${{ inputs.release_version }}\`"
+            echo "- updater feed: ${{ steps.rollback.outputs.latest_url }}"
+            echo "- scope: prevents new installs from receiving a superseded version"
+            echo "- clients already on a newer payload require a forward hotfix; forced downgrade is intentionally disabled"
+          } >> "$GITHUB_STEP_SUMMARY"

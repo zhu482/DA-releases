@@ -1,0 +1,456 @@
+name: release-da-macos-github
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the signed DA release and move the in-app updater feed."
+        required: true
+        type: boolean
+        default: true
+      release_version:
+        description: "Optional counted version override, for example 0.18.2-betas.12."
+        required: false
+        type: string
+        default: ""
+      sign_mode:
+        description: "Developer ID signing policy. Notarize is required for first-install distribution."
+        required: true
+        type: choice
+        options:
+          - notarize
+          - sign-only
+        default: notarize
+      smoke_mode:
+        description: "Full proves payload update, relaunch, and persistent project data locally."
+        required: true
+        type: choice
+        options:
+          - full
+          - core
+        default: full
+      source_ref:
+        description: "Private DA source branch, tag, or commit to release."
+        required: true
+        type: string
+        default: "gr-portover-20260812"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: da-macos-github-betas
+  cancel-in-progress: false
+
+env:
+  PATH: /opt/homebrew/opt/node@24/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  RELEASE_REPOSITORY: zhu482/DA
+  RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+  RELEASE_RUN_ID: ${{ github.run_id }}
+  RELEASE_WORKFLOW: ${{ github.workflow }}
+
+jobs:
+  release:
+    name: Build, publish, and verify DA macOS updater
+    runs-on: [self-hosted, macOS, ARM64, da-release-public]
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout public release feed
+        uses: actions/checkout@v6.0.2
+        with:
+          clean: true
+          fetch-depth: 1
+          lfs: false
+          path: feed
+
+      - name: Checkout private DA source read-only
+        uses: actions/checkout@v6.0.2
+        with:
+          clean: true
+          fetch-depth: 1
+          lfs: false
+          path: source
+          ref: ${{ inputs.source_ref }}
+          repository: zhu482/DA
+          ssh-key: ${{ secrets.DA_SOURCE_DEPLOY_KEY }}
+
+      - name: Install DA release toolchain
+        run: |
+          set -euo pipefail
+          corepack prepare pnpm@10.33.2 --activate
+          pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Resolve GitHub distribution endpoints
+        id: distribution
+        env:
+          RELEASE_REPOSITORY_INPUT: ${{ github.repository }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_REPOSITORY_INPUT" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo "release_repository must be OWNER/REPOSITORY" >&2
+            exit 1
+          }
+          source_commit="$(git rev-parse HEAD)"
+          {
+            echo "repository=$RELEASE_REPOSITORY_INPUT"
+            echo "release_download_root=https://github.com/$RELEASE_REPOSITORY_INPUT/releases/download"
+            echo "latest_origin=https://raw.githubusercontent.com/$RELEASE_REPOSITORY_INPUT/main"
+            echo "latest_url=https://raw.githubusercontent.com/$RELEASE_REPOSITORY_INPUT/main/betas/latest/metadata.json"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GITHUB_REF_NAME=$SOURCE_REF"
+            echo "GITHUB_SHA=$source_commit"
+            echo "RELEASE_BRANCH=$SOURCE_REF"
+            echo "RELEASE_COMMIT=$source_commit"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate production release authority
+        env:
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ steps.distribution.outputs.repository }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo "missing GitHub workflow token" >&2; exit 1; }
+          test -n "$APPLE_SIGNING_CERTIFICATE_BASE64" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_BASE64" >&2; exit 1; }
+          test -n "$APPLE_SIGNING_CERTIFICATE_PASSWORD" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_PASSWORD" >&2; exit 1; }
+          visibility="$(gh api "repos/$GH_REPO" --jq .visibility)"
+          test "$visibility" = "public" || { echo "$GH_REPO must remain public for token-free in-app updates" >&2; exit 1; }
+          if [ "${{ inputs.sign_mode }}" = "notarize" ]; then
+            test -n "$APPLE_ID" || { echo "missing GitHub secret APPLE_ID" >&2; exit 1; }
+            test -n "$APPLE_TEAM_ID" || { echo "missing GitHub secret APPLE_TEAM_ID" >&2; exit 1; }
+            test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "missing GitHub secret APPLE_APP_SPECIFIC_PASSWORD" >&2; exit 1; }
+          fi
+
+      - name: Resolve next DA release version
+        id: prepare
+        env:
+          DA_BETAS_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+        run: pnpm exec tools-release prepare betas
+
+      - name: Select and validate DA release version
+        id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.release_version }}
+          PREPARED_VERSION: ${{ steps.prepare.outputs.release_version }}
+          RELEASE_DOWNLOAD_ROOT: ${{ steps.distribution.outputs.release_download_root }}
+        run: |
+          set -euo pipefail
+          version="$MANUAL_VERSION"
+          if [ -z "$version" ]; then version="$PREPARED_VERSION"; fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-betas\.[1-9][0-9]*$ ]] || {
+            echo "invalid DA betas version: $version" >&2
+            exit 1
+          }
+          tag="da-$version"
+          {
+            echo "release_version=$version"
+            echo "asset_suffix=.signed"
+            echo "version_tag=$tag"
+            echo "version_origin=$RELEASE_DOWNLOAD_ROOT/$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Capture previous updater feed
+        env:
+          PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
+          RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$PREVIOUS_METADATA_PATH")"
+          /usr/bin/curl --fail --location --silent --show-error \
+            -H 'Cache-Control: no-cache' \
+            "$RELEASE_METADATA_URL?before=${{ github.run_id }}" \
+            -o "$PREVIOUS_METADATA_PATH" || rm -f "$PREVIOUS_METADATA_PATH"
+
+      - name: Build signed and notarized DA macOS artifacts
+        env:
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD_JSON_PATH: ${{ runner.temp }}/da-release/build/build.json
+          BUILD_LOG_PATH: ${{ runner.temp }}/da-release/build/build.log
+          DA_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+          MAC_COMPRESSION: normal
+          OPEN_DESIGN_AMR_PROFILE: prod
+          RELEASE_BUILD_TARGET: dmg
+          RELEASE_CHANNEL: betas
+          RELEASE_NAMESPACE: release-betas
+          RELEASE_OUTPUTS_PATH: ${{ runner.temp }}/da-release/build/outputs.json
+          RELEASE_REPORT_DIR: ${{ runner.temp }}/da-release/report/mac_arm64
+          RELEASE_SIGN_MODE: ${{ inputs.sign_mode }}
+          RELEASE_SMOKE_MODE: ${{ inputs.smoke_mode }}
+          RELEASE_TARGET: mac_arm64
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          RELEASE_WORK_DIR: ${{ runner.temp }}/da-release/work
+          REQUIRE_VELA_CLI: "false"
+          TOOLS_PACK_CACHE_DIR: ${{ runner.temp }}/da-release/tools-pack-cache
+          TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/tools-pack
+        run: bash tools/release/scripts/build-platform.sh
+
+      - name: Prepare immutable updater assets
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_ARTIFACT_MODE: dmg-and-payload
+          RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/da-release/assets/mac_arm64
+          RELEASE_CHANNEL: betas
+          RELEASE_NAMESPACE: release-betas
+          RELEASE_NOTES: Design AI ${{ steps.version.outputs.release_version }}
+          RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
+          RELEASE_TARGET: mac_arm64
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/tools-pack
+        run: bash tools/release/scripts/prepare-platform-assets.sh
+
+      - name: Generate GitHub Release platform manifest
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_ARTIFACT_MODE: dmg-and-payload
+          RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/da-release/assets/mac_arm64
+          RELEASE_CHANNEL: betas
+          RELEASE_DRY_RUN_MODE: github-release-plan
+          RELEASE_EXTERNAL_PUBLISH: "true"
+          RELEASE_LATEST_PUBLIC_ORIGIN: ${{ steps.distribution.outputs.latest_origin }}
+          RELEASE_LATEST_PUBLIC_URL_LAYOUT: hierarchical
+          RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
+          RELEASE_OUTPUTS_PATH: ${{ runner.temp }}/da-release/platform-outputs.json
+          RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
+          RELEASE_PUBLIC_URL_LAYOUT: flat
+          RELEASE_PUBLISH_SIDE_EFFECTS: "false"
+          RELEASE_SIGNED: "true"
+          RELEASE_TARGET: mac_arm64
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          RELEASE_VERSION_LOCK_REQUIRED: "false"
+        run: pnpm exec tools-release publish-platform
+
+      - name: Generate complete DA release metadata
+        if: ${{ inputs.publish }}
+        env:
+          BASE_VERSION: ${{ steps.prepare.outputs.base_version }}
+          ENABLE_LINUX_X64: "false"
+          ENABLE_MAC_ARM64: "true"
+          ENABLE_MAC_X64: "false"
+          ENABLE_WIN_X64: "false"
+          LINUX_X64_RESULT: skipped
+          MAC_ARM64_RESULT: success
+          MAC_X64_RESULT: skipped
+          RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
+          RELEASE_CHANNEL: betas
+          RELEASE_DRY_RUN_MODE: github-release-plan
+          RELEASE_EXTERNAL_PUBLISH: "true"
+          RELEASE_LATEST_PUBLIC_ORIGIN: ${{ steps.distribution.outputs.latest_origin }}
+          RELEASE_LATEST_PUBLIC_URL_LAYOUT: hierarchical
+          RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/da-release/metadata
+          RELEASE_OUTPUTS_PATH: ${{ runner.temp }}/da-release/metadata-outputs.json
+          RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
+          RELEASE_PUBLIC_URL_LAYOUT: flat
+          RELEASE_PUBLISH_SIDE_EFFECTS: "false"
+          RELEASE_SIGNED: "true"
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          RELEASE_VERSION_LOCK_REQUIRED: "false"
+          STATE_SOURCE: GitHub immutable version release
+          WIN_X64_RESULT: skipped
+        run: |
+          set -euo pipefail
+          pnpm exec tools-release publish-metadata
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.env.RELEASE_METADATA_DIR + "/metadata.json", "utf8"));
+          if (metadata.dryRun !== false || metadata.releaseState !== "complete" || metadata.allReadyTargetsSigned !== true) {
+            throw new Error("generated DA metadata is not complete and signed");
+          }
+          NODE
+
+      - name: Publish immutable GitHub Release
+        if: ${{ inputs.publish }}
+        env:
+          GH_REPO: ${{ steps.distribution.outputs.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/da-release/assets/mac_arm64
+          RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/da-release/metadata
+          RELEASE_UPLOAD_DIR: ${{ runner.temp }}/da-release/github-version-assets
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          VERSION_TAG: ${{ steps.version.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "refusing to rewrite immutable release $GH_REPO@$VERSION_TAG" >&2
+            exit 1
+          fi
+          rm -rf "$RELEASE_UPLOAD_DIR"
+          mkdir -p "$RELEASE_UPLOAD_DIR"
+          cp "$RELEASE_ASSETS_DIR"/* "$RELEASE_UPLOAD_DIR/"
+          cp "$RELEASE_MANIFEST_DIR/mac_arm64.json" "$RELEASE_UPLOAD_DIR/platforms--mac_arm64.json"
+          cp "$RELEASE_METADATA_DIR/metadata.json" "$RELEASE_UPLOAD_DIR/metadata.json"
+          gh release create "$VERSION_TAG" --repo "$GH_REPO" --draft --prerelease \
+            --title "Design AI $RELEASE_VERSION" \
+            --notes "Signed Design AI desktop release $RELEASE_VERSION. Assets are consumed by the in-app updater."
+          gh release upload "$VERSION_TAG" "$RELEASE_UPLOAD_DIR"/* --repo "$GH_REPO"
+          gh release edit "$VERSION_TAG" --repo "$GH_REPO" --draft=false --prerelease
+
+      - name: Verify immutable version from GitHub
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_METADATA_URL: ${{ steps.version.outputs.version_origin }}/metadata.json
+          RELEASE_PUBLIC_ORIGIN: ${{ steps.distribution.outputs.release_download_root }}
+          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-release/version-verification.json
+          RELEASE_VERIFY_TARGETS: mac_arm64
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+        run: pnpm exec tools-release verify-public-release
+
+      - name: Atomically move the public updater feed
+        if: ${{ inputs.publish }}
+        env:
+          FEED_CHECKOUT: ${{ github.workspace }}/feed
+          GH_REPO: ${{ steps.distribution.outputs.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/da-release/metadata
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$FEED_CHECKOUT/betas/latest/platforms"
+          cp "$RELEASE_MANIFEST_DIR/mac_arm64.json" "$FEED_CHECKOUT/betas/latest/platforms/mac_arm64.json"
+          cp "$RELEASE_METADATA_DIR/metadata.json" "$FEED_CHECKOUT/betas/latest/metadata.json"
+          git -C "$FEED_CHECKOUT" config user.name "Design AI Release Bot"
+          git -C "$FEED_CHECKOUT" config user.email "design-ai-release@users.noreply.github.com"
+          git -C "$FEED_CHECKOUT" add betas/latest
+          if git -C "$FEED_CHECKOUT" diff --cached --quiet; then
+            echo "updater feed already points to $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          git -C "$FEED_CHECKOUT" commit -m "release: Design AI $RELEASE_VERSION"
+          git -C "$FEED_CHECKOUT" push origin HEAD:main
+
+      - name: Verify live in-app updater feed and every artifact
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+          RELEASE_PUBLIC_ORIGINS: ${{ steps.distribution.outputs.latest_origin }},${{ steps.distribution.outputs.release_download_root }}
+          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-release/latest-verification.json
+          RELEASE_VERIFY_TARGETS: mac_arm64
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+        run: pnpm exec tools-release verify-public-release
+
+      - name: Resolve previous DA release for live updater acceptance
+        if: ${{ inputs.publish }}
+        id: previous_release
+        env:
+          CURRENT_RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
+          RELEASE_DOWNLOAD_ROOT: ${{ steps.distribution.outputs.release_download_root }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync } from "node:fs";
+          const output = process.env.GITHUB_OUTPUT;
+          const previousPath = process.env.PREVIOUS_METADATA_PATH;
+          if (!existsSync(previousPath)) {
+            appendFileSync(output, "available=false\n");
+            process.exit(0);
+          }
+          const metadata = JSON.parse(readFileSync(previousPath, "utf8"));
+          const version = metadata.releaseVersion;
+          const target = metadata.releaseTargets?.mac_arm64;
+          const dmg = target?.artifacts?.dmg;
+          const valid =
+            typeof version === "string" &&
+            version !== process.env.CURRENT_RELEASE_VERSION &&
+            /^[0-9]+\.[0-9]+\.[0-9]+-betas\.[1-9][0-9]*$/u.test(version) &&
+            metadata.releaseState === "complete" &&
+            target?.status === "published" &&
+            target?.signed === true &&
+            typeof dmg?.url === "string" &&
+            typeof dmg?.sha256Url === "string" &&
+            Number.isSafeInteger(dmg?.size) &&
+            dmg.size > 0;
+          if (!valid) {
+            appendFileSync(output, "available=false\n");
+            process.exit(0);
+          }
+          const releasePrefix = process.env.RELEASE_DOWNLOAD_ROOT.replace(/\/+$/u, "") + "/";
+          for (const url of [dmg.url, dmg.sha256Url]) {
+            if (!url.startsWith(releasePrefix) || new URL(url).protocol !== "https:") {
+              throw new Error(`previous release URL is outside GitHub Releases: ${url}`);
+            }
+          }
+          appendFileSync(output, [
+            "available=true",
+            `release_version=${version}`,
+            `dmg_url=${dmg.url}`,
+            `sha256_url=${dmg.sha256Url}`,
+            `size=${dmg.size}`,
+            "",
+          ].join("\n"));
+          NODE
+
+      - name: Prove previous installed DA updates from live GitHub and retains its project
+        if: ${{ inputs.publish && steps.previous_release.outputs.available == 'true' }}
+        env:
+          OD_PACKAGED_E2E_BUILD_JSON_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.json
+          OD_PACKAGED_E2E_BUILD_LOG_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.log
+          OD_PACKAGED_E2E_MAC: "1"
+          OD_PACKAGED_E2E_MAC_SMOKE_PROFILE: full
+          OD_PACKAGED_E2E_MAC_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
+          OD_PACKAGED_E2E_MAC_UPDATE_VERSION: ${{ steps.version.outputs.release_version }}
+          OD_PACKAGED_E2E_NAMESPACE: release-betas
+          OD_PACKAGED_E2E_RELEASE_CHANNEL: betas
+          OD_PACKAGED_E2E_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
+          OD_PACKAGED_E2E_REPORT_DIR: ${{ runner.temp }}/da-release/report/live-github-updater
+          OD_PACKAGED_E2E_TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/live-updater-acceptance/tools-pack
+          PREVIOUS_DMG_SHA256_URL: ${{ steps.previous_release.outputs.sha256_url }}
+          PREVIOUS_DMG_SIZE: ${{ steps.previous_release.outputs.size }}
+          PREVIOUS_DMG_URL: ${{ steps.previous_release.outputs.dmg_url }}
+          PREVIOUS_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          dmg_path="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/out/mac/namespaces/release-betas/dmg/Design AI-release-betas.dmg"
+          sha_path="$dmg_path.sha256"
+          mkdir -p "$(dirname "$dmg_path")" "$OD_PACKAGED_E2E_REPORT_DIR"
+          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
+            "$PREVIOUS_DMG_URL?acceptance=${{ github.run_id }}" -o "$dmg_path"
+          /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
+            "$PREVIOUS_DMG_SHA256_URL?acceptance=${{ github.run_id }}" -o "$sha_path"
+          expected_sha="$(awk '{print $1}' "$sha_path")"
+          [[ "$expected_sha" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "invalid previous DMG checksum" >&2; exit 1; }
+          expected_sha="$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')"
+          actual_sha="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
+          test "$actual_sha" = "$expected_sha" || { echo "previous DMG checksum mismatch" >&2; exit 1; }
+          actual_size="$(stat -f %z "$dmg_path")"
+          test "$actual_size" = "$PREVIOUS_DMG_SIZE" || { echo "previous DMG size mismatch" >&2; exit 1; }
+          printf '{"dmgPath":"%s","version":"%s"}\n' "$dmg_path" "$PREVIOUS_RELEASE_VERSION" > "$OD_PACKAGED_E2E_BUILD_JSON_PATH"
+          : > "$OD_PACKAGED_E2E_BUILD_LOG_PATH"
+          pnpm --dir e2e exec tsx scripts/release-smoke.ts mac specs/mac.spec.ts
+
+      - name: Publish DA release summary
+        if: ${{ always() }}
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          UPDATE_URL: ${{ steps.distribution.outputs.latest_url }}
+        run: |
+          {
+            echo "## Design AI macOS update"
+            echo
+            echo "- version: \`$RELEASE_VERSION\`"
+            echo "- updater feed: $UPDATE_URL"
+            echo "- distribution: GitHub Releases + atomic public manifest commit"
+            echo "- publish requested: \`${{ inputs.publish }}\`"
+            echo "- signing: \`${{ inputs.sign_mode }}\`"
+            echo "- smoke: \`${{ inputs.smoke_mode }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
