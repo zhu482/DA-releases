@@ -460,6 +460,7 @@ jobs:
           OD_PACKAGED_E2E_BUILD_LOG_PATH: ${{ runner.temp }}/da-release/live-updater-acceptance/build.log
           OD_PACKAGED_E2E_MAC: "1"
           OD_PACKAGED_E2E_MAC_SMOKE_PROFILE: full
+          OD_PACKAGED_E2E_MAC_UPDATE_DOWNLOAD_TIMEOUT_MS: "1200000"
           OD_PACKAGED_E2E_MAC_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
           OD_PACKAGED_E2E_MAC_UPDATE_VERSION: ${{ steps.version.outputs.release_version }}
           OD_PACKAGED_E2E_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
