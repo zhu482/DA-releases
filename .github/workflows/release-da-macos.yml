@@ -226,6 +226,7 @@ jobs:
           BUILD_LOG_PATH: ${{ runner.temp }}/da-release/build/build.log
           DA_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
           MAC_COMPRESSION: normal
+          OD_PACKAGED_E2E_MAC_ROLLBACK_TEST_TIMEOUT_MS: "900000"
           OPEN_DESIGN_AMR_PROFILE: prod
           RELEASE_BUILD_TARGET: dmg
           RELEASE_CHANNEL: betas
