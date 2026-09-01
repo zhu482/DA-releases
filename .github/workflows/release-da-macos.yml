@@ -128,6 +128,8 @@ jobs:
           test -n "$GH_TOKEN" || { echo "missing GitHub workflow token" >&2; exit 1; }
           visibility="$(gh api "repos/$GH_REPO" --jq .visibility)"
           test "$visibility" = "public" || { echo "$GH_REPO must remain public for token-free in-app updates" >&2; exit 1; }
+          can_push="$(gh api "repos/$GH_REPO" --jq '.permissions.push')"
+          test "$can_push" = "true" || { echo "workflow token cannot publish updater manifests to $GH_REPO" >&2; exit 1; }
           if [ "${{ inputs.validation_only }}" = "true" ]; then
             exit 0
           fi
