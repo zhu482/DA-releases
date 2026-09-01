@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: false
+      unsigned_test:
+        description: "Publish to an isolated unsigned test feed. Never consumed by production clients."
+        required: true
+        type: boolean
+        default: false
       publish:
         description: "Publish the signed DA release and move the in-app updater feed."
         required: true
@@ -45,7 +50,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: da-macos-github-betas
+  group: da-macos-github-${{ inputs.unsigned_test && 'unsigned-test' || 'betas' }}
   cancel-in-progress: false
 
 env:
@@ -94,6 +99,7 @@ jobs:
         env:
           RELEASE_REPOSITORY_INPUT: ${{ github.repository }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          UNSIGNED_TEST: ${{ inputs.unsigned_test }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_REPOSITORY_INPUT" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -101,11 +107,16 @@ jobs:
             exit 1
           }
           source_commit="$(git rev-parse HEAD)"
+          feed_path="betas/latest"
+          if [ "$UNSIGNED_TEST" = "true" ]; then
+            feed_path="tests/unsigned/latest"
+          fi
           {
             echo "repository=$RELEASE_REPOSITORY_INPUT"
             echo "release_download_root=https://github.com/$RELEASE_REPOSITORY_INPUT/releases/download"
             echo "latest_origin=https://raw.githubusercontent.com/$RELEASE_REPOSITORY_INPUT/main"
-            echo "latest_url=https://raw.githubusercontent.com/$RELEASE_REPOSITORY_INPUT/main/betas/latest/metadata.json"
+            echo "latest_url=https://raw.githubusercontent.com/$RELEASE_REPOSITORY_INPUT/main/$feed_path/metadata.json"
+            echo "feed_path=$feed_path"
           } >> "$GITHUB_OUTPUT"
           {
             echo "GITHUB_REF_NAME=$SOURCE_REF"
@@ -130,7 +141,7 @@ jobs:
           test "$visibility" = "public" || { echo "$GH_REPO must remain public for token-free in-app updates" >&2; exit 1; }
           git -C ../feed push --dry-run origin \
             "HEAD:refs/heads/da-release-write-probe-$RELEASE_RUN_ID"
-          if [ "${{ inputs.validation_only }}" = "true" ]; then
+          if [ "${{ inputs.validation_only }}" = "true" ] || [ "${{ inputs.unsigned_test }}" = "true" ]; then
             exit 0
           fi
           test -n "$APPLE_SIGNING_CERTIFICATE_BASE64" || { echo "missing GitHub secret APPLE_SIGNING_CERTIFICATE_BASE64" >&2; exit 1; }
@@ -172,9 +183,20 @@ jobs:
             exit 1
           }
           tag="da-$version"
+          asset_suffix=".signed"
+          release_signed="true"
+          release_namespace="release-betas"
+          if [ "${{ inputs.unsigned_test }}" = "true" ]; then
+            tag="da-unsigned-test-$version"
+            asset_suffix=".unsigned"
+            release_signed="false"
+            release_namespace="release-github-unsigned-test"
+          fi
           {
             echo "release_version=$version"
-            echo "asset_suffix=.signed"
+            echo "asset_suffix=$asset_suffix"
+            echo "release_signed=$release_signed"
+            echo "release_namespace=$release_namespace"
             echo "version_tag=$tag"
             echo "version_origin=$RELEASE_DOWNLOAD_ROOT/$tag"
           } >> "$GITHUB_OUTPUT"
@@ -192,7 +214,7 @@ jobs:
             "$RELEASE_METADATA_URL?before=${{ github.run_id }}" \
             -o "$PREVIOUS_METADATA_PATH" || rm -f "$PREVIOUS_METADATA_PATH"
 
-      - name: Build signed and notarized DA macOS artifacts
+      - name: Build DA macOS artifacts
         if: ${{ !inputs.validation_only }}
         env:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -207,10 +229,10 @@ jobs:
           OPEN_DESIGN_AMR_PROFILE: prod
           RELEASE_BUILD_TARGET: dmg
           RELEASE_CHANNEL: betas
-          RELEASE_NAMESPACE: release-betas
+          RELEASE_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
           RELEASE_OUTPUTS_PATH: ${{ runner.temp }}/da-release/build/outputs.json
           RELEASE_REPORT_DIR: ${{ runner.temp }}/da-release/report/mac_arm64
-          RELEASE_SIGN_MODE: ${{ inputs.sign_mode }}
+          RELEASE_SIGN_MODE: ${{ inputs.unsigned_test && 'no' || inputs.sign_mode }}
           RELEASE_SMOKE_MODE: ${{ inputs.smoke_mode }}
           RELEASE_TARGET: mac_arm64
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
@@ -227,7 +249,7 @@ jobs:
           RELEASE_ASSET_SUFFIX: ${{ steps.version.outputs.asset_suffix }}
           RELEASE_ASSETS_DIR: ${{ runner.temp }}/da-release/assets/mac_arm64
           RELEASE_CHANNEL: betas
-          RELEASE_NAMESPACE: release-betas
+          RELEASE_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
           RELEASE_NOTES: Design AI ${{ steps.version.outputs.release_version }}
           RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
           RELEASE_TARGET: mac_arm64
@@ -251,7 +273,7 @@ jobs:
           RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
           RELEASE_PUBLIC_URL_LAYOUT: flat
           RELEASE_PUBLISH_SIDE_EFFECTS: "false"
-          RELEASE_SIGNED: "true"
+          RELEASE_SIGNED: ${{ steps.version.outputs.release_signed }}
           RELEASE_TARGET: mac_arm64
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
           RELEASE_VERSION_LOCK_REQUIRED: "false"
@@ -280,7 +302,7 @@ jobs:
           RELEASE_PUBLIC_ORIGIN: ${{ steps.version.outputs.version_origin }}
           RELEASE_PUBLIC_URL_LAYOUT: flat
           RELEASE_PUBLISH_SIDE_EFFECTS: "false"
-          RELEASE_SIGNED: "true"
+          RELEASE_SIGNED: ${{ steps.version.outputs.release_signed }}
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
           RELEASE_VERSION_LOCK_REQUIRED: "false"
           STATE_SOURCE: GitHub immutable version release
@@ -291,8 +313,9 @@ jobs:
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
           const metadata = JSON.parse(readFileSync(process.env.RELEASE_METADATA_DIR + "/metadata.json", "utf8"));
-          if (metadata.dryRun !== false || metadata.releaseState !== "complete" || metadata.allReadyTargetsSigned !== true) {
-            throw new Error("generated DA metadata is not complete and signed");
+          const expectedSigned = process.env.RELEASE_SIGNED === "true";
+          if (metadata.dryRun !== false || metadata.releaseState !== "complete" || metadata.allReadyTargetsSigned !== expectedSigned) {
+            throw new Error(`generated DA metadata does not match complete/signed=${expectedSigned}`);
           }
           NODE
 
@@ -305,6 +328,7 @@ jobs:
           RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
           RELEASE_METADATA_DIR: ${{ runner.temp }}/da-release/metadata
           RELEASE_UPLOAD_DIR: ${{ runner.temp }}/da-release/github-version-assets
+          RELEASE_SIGNED: ${{ steps.version.outputs.release_signed }}
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
           VERSION_TAG: ${{ steps.version.outputs.version_tag }}
         run: |
@@ -318,9 +342,13 @@ jobs:
           cp "$RELEASE_ASSETS_DIR"/* "$RELEASE_UPLOAD_DIR/"
           cp "$RELEASE_MANIFEST_DIR/mac_arm64.json" "$RELEASE_UPLOAD_DIR/platforms--mac_arm64.json"
           cp "$RELEASE_METADATA_DIR/metadata.json" "$RELEASE_UPLOAD_DIR/metadata.json"
+          release_kind="Signed Design AI desktop release"
+          if [ "$RELEASE_SIGNED" != "true" ]; then
+            release_kind="UNSIGNED TEST-ONLY Design AI desktop release"
+          fi
           gh release create "$VERSION_TAG" --repo "$GH_REPO" --draft --prerelease \
-            --title "Design AI $RELEASE_VERSION" \
-            --notes "Signed Design AI desktop release $RELEASE_VERSION. Assets are consumed by the in-app updater."
+            --title "Design AI $RELEASE_VERSION${{ inputs.unsigned_test && ' unsigned test' || '' }}" \
+            --notes "$release_kind $RELEASE_VERSION. Assets are consumed only by its matching updater feed."
           gh release upload "$VERSION_TAG" "$RELEASE_UPLOAD_DIR"/* --repo "$GH_REPO"
           gh release edit "$VERSION_TAG" --repo "$GH_REPO" --draft=false --prerelease
 
@@ -329,7 +357,7 @@ jobs:
         env:
           RELEASE_METADATA_URL: ${{ steps.version.outputs.version_origin }}/metadata.json
           RELEASE_PUBLIC_ORIGIN: ${{ steps.distribution.outputs.release_download_root }}
-          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_REQUIRE_SIGNED: ${{ steps.version.outputs.release_signed }}
           RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-release/version-verification.json
           RELEASE_VERIFY_TARGETS: mac_arm64
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
@@ -341,17 +369,18 @@ jobs:
           FEED_CHECKOUT: ${{ github.workspace }}/feed
           GH_REPO: ${{ steps.distribution.outputs.repository }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_FEED_PATH: ${{ steps.distribution.outputs.feed_path }}
           RELEASE_MANIFEST_DIR: ${{ runner.temp }}/da-release/manifests
           RELEASE_METADATA_DIR: ${{ runner.temp }}/da-release/metadata
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
         run: |
           set -euo pipefail
-          mkdir -p "$FEED_CHECKOUT/betas/latest/platforms"
-          cp "$RELEASE_MANIFEST_DIR/mac_arm64.json" "$FEED_CHECKOUT/betas/latest/platforms/mac_arm64.json"
-          cp "$RELEASE_METADATA_DIR/metadata.json" "$FEED_CHECKOUT/betas/latest/metadata.json"
+          mkdir -p "$FEED_CHECKOUT/$RELEASE_FEED_PATH/platforms"
+          cp "$RELEASE_MANIFEST_DIR/mac_arm64.json" "$FEED_CHECKOUT/$RELEASE_FEED_PATH/platforms/mac_arm64.json"
+          cp "$RELEASE_METADATA_DIR/metadata.json" "$FEED_CHECKOUT/$RELEASE_FEED_PATH/metadata.json"
           git -C "$FEED_CHECKOUT" config user.name "Design AI Release Bot"
           git -C "$FEED_CHECKOUT" config user.email "design-ai-release@users.noreply.github.com"
-          git -C "$FEED_CHECKOUT" add betas/latest
+          git -C "$FEED_CHECKOUT" add "$RELEASE_FEED_PATH"
           if git -C "$FEED_CHECKOUT" diff --cached --quiet; then
             echo "updater feed already points to $RELEASE_VERSION" >&2
             exit 1
@@ -364,7 +393,7 @@ jobs:
         env:
           RELEASE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
           RELEASE_PUBLIC_ORIGINS: ${{ steps.distribution.outputs.latest_origin }},${{ steps.distribution.outputs.release_download_root }}
-          RELEASE_REQUIRE_SIGNED: "true"
+          RELEASE_REQUIRE_SIGNED: ${{ steps.version.outputs.release_signed }}
           RELEASE_VERIFY_OUTPUT_PATH: ${{ runner.temp }}/da-release/latest-verification.json
           RELEASE_VERIFY_TARGETS: mac_arm64
           RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
@@ -375,6 +404,7 @@ jobs:
         id: previous_release
         env:
           CURRENT_RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          EXPECTED_SIGNED: ${{ steps.version.outputs.release_signed }}
           PREVIOUS_METADATA_PATH: ${{ runner.temp }}/da-release/previous-metadata.json
           RELEASE_DOWNLOAD_ROOT: ${{ steps.distribution.outputs.release_download_root }}
         run: |
@@ -391,13 +421,14 @@ jobs:
           const version = metadata.releaseVersion;
           const target = metadata.releaseTargets?.mac_arm64;
           const dmg = target?.artifacts?.dmg;
+          const expectedSigned = process.env.EXPECTED_SIGNED === "true";
           const valid =
             typeof version === "string" &&
             version !== process.env.CURRENT_RELEASE_VERSION &&
             /^[0-9]+\.[0-9]+\.[0-9]+-betas\.[1-9][0-9]*$/u.test(version) &&
             metadata.releaseState === "complete" &&
             target?.status === "published" &&
-            target?.signed === true &&
+            target?.signed === expectedSigned &&
             typeof dmg?.url === "string" &&
             typeof dmg?.sha256Url === "string" &&
             Number.isSafeInteger(dmg?.size) &&
@@ -431,7 +462,7 @@ jobs:
           OD_PACKAGED_E2E_MAC_SMOKE_PROFILE: full
           OD_PACKAGED_E2E_MAC_UPDATE_METADATA_URL: ${{ steps.distribution.outputs.latest_url }}
           OD_PACKAGED_E2E_MAC_UPDATE_VERSION: ${{ steps.version.outputs.release_version }}
-          OD_PACKAGED_E2E_NAMESPACE: release-betas
+          OD_PACKAGED_E2E_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
           OD_PACKAGED_E2E_RELEASE_CHANNEL: betas
           OD_PACKAGED_E2E_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
           OD_PACKAGED_E2E_REPORT_DIR: ${{ runner.temp }}/da-release/report/live-github-updater
@@ -442,7 +473,7 @@ jobs:
           PREVIOUS_RELEASE_VERSION: ${{ steps.previous_release.outputs.release_version }}
         run: |
           set -euo pipefail
-          dmg_path="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/out/mac/namespaces/release-betas/dmg/Design AI-release-betas.dmg"
+          dmg_path="$OD_PACKAGED_E2E_TOOLS_PACK_DIR/out/mac/namespaces/${OD_PACKAGED_E2E_NAMESPACE}/dmg/Design AI-${OD_PACKAGED_E2E_NAMESPACE}.dmg"
           sha_path="$dmg_path.sha256"
           mkdir -p "$(dirname "$dmg_path")" "$OD_PACKAGED_E2E_REPORT_DIR"
           /usr/bin/curl --fail --location --silent --show-error -H 'Cache-Control: no-cache' \
@@ -473,7 +504,8 @@ jobs:
             echo "- updater feed: $UPDATE_URL"
             echo "- distribution: GitHub Releases + atomic public manifest commit"
             echo "- validation only: \`${{ inputs.validation_only }}\`"
+            echo "- unsigned isolated test: \`${{ inputs.unsigned_test }}\`"
             echo "- publish requested: \`${{ inputs.publish }}\`"
-            echo "- signing: \`${{ inputs.sign_mode }}\`"
+            echo "- signing: \`${{ inputs.unsigned_test && 'no' || inputs.sign_mode }}\`"
             echo "- smoke: \`${{ inputs.smoke_mode }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
