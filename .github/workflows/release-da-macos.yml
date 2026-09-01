@@ -214,6 +214,17 @@ jobs:
             "$RELEASE_METADATA_URL?before=${{ github.run_id }}" \
             -o "$PREVIOUS_METADATA_PATH" || rm -f "$PREVIOUS_METADATA_PATH"
 
+      - name: Clean stale macOS test mount
+        if: ${{ !inputs.validation_only }}
+        env:
+          RELEASE_NAMESPACE: ${{ steps.version.outputs.release_namespace }}
+          TOOLS_PACK_DIR: ${{ runner.temp }}/da-release/tools-pack
+        run: |
+          pnpm exec tools-pack mac cleanup \
+            --dir "$TOOLS_PACK_DIR" \
+            --namespace "$RELEASE_NAMESPACE" \
+            --json
+
       - name: Build DA macOS artifacts
         if: ${{ !inputs.validation_only }}
         env:
